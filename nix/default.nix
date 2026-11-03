@@ -38,16 +38,47 @@ let
       esac
     '';
   };
+  makeNativeStratum =
+    { name, payload }:
+    assert lib.assertMsg (
+      builtins.match "[A-Za-z0-9_][A-Za-z0-9_.+-]*" name != null
+    ) "invalid stratum name";
+    pkgs.runCommand "${name}-native-stratum"
+      {
+        nativeBuildInputs = [
+          pkgs.gnutar
+          pkgs.gzip
+        ];
+      }
+      ''
+        mkdir -p $out
+        tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner -C ${payload} -cf - . | gzip -n > $out/stratum.tar.gz
+      '';
   makeStratum =
     {
       pkg,
       program ? pkg.meta.mainProgram or pkg.pname,
       offline ? false,
       hardware ? null,
+      bundledNixStore ? null,
+      bundledNixNotices ? [ ],
     }:
     assert lib.assertMsg (
       builtins.match "[A-Za-z0-9_][A-Za-z0-9_.+-]*" program != null
     ) "invalid executable name";
+    let
+      appSdk =
+        if bundledNixStore == null then
+          sdk
+        else
+          pkgs.linkFarm "brl-python-sdk" [
+            {
+              name = "python";
+              path = pkgs.python3;
+            }
+          ];
+      bundle = core.makeRuntimeTree { inherit bundledNixStore bundledNixNotices; };
+    in
     pkgs.runCommand "${pkg.pname}-${pkg.version}-bedrock-stratum"
       {
         __structuredAttrs = true;
@@ -65,13 +96,18 @@ let
         cp ${../src/state.py} "$implementation/state.py"
         cp ${coreSrc}/src/engine.py "$implementation/engine.py"
         cp ${../LICENSE} "$implementation/LICENSE"
+        ${lib.optionalString (bundledNixStore != null) ''
+          cp ${bundle}/usr/lib/brl-impurifier/nix-store "$implementation/nix-store"
+          mkdir -p "$implementation/share/licenses/bundled-nix"
+          cp -r ${bundle}/usr/share/licenses/brl-impurifier/bundled-nix/. "$implementation/share/licenses/bundled-nix/"
+        ''}
         cp ${
           pkgs.writeText "application.json" (
             builtins.toJSON {
               inherit program offline;
               inherit (pkg) pname version;
               installable = toString pkg;
-              sdk = toString sdk;
+              sdk = toString appSdk;
               nixBin = "${pkgs.nix}/bin";
               implementationDigest =
                 builtins.hashFile "sha256" ../src/launch.py
@@ -95,7 +131,7 @@ let
         printf 'NAME="Nix application stratum"\nID=nix-impurifiers\nVERSION_ID="${pkg.version}"\n' > root/etc/os-release
         ${lib.optionalString offline ''
           cp -r ${core.offlineCache pkg} "$implementation/cache"
-          cp -r ${core.offlineCache sdk} "$implementation/sdk-cache"
+          cp -r ${core.offlineCache appSdk} "$implementation/sdk-cache"
         ''}
         tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner -C root -cf - . | gzip -n > $out/stratum.tar.gz
       '';
@@ -106,6 +142,7 @@ in
     sdk
     installer
     makeStratum
+    makeNativeStratum
     ;
   makeNetStratum = args: makeStratum (args // { offline = false; });
   makeOfflineStratum = args: makeStratum (args // { offline = true; });

@@ -70,3 +70,23 @@ strata, other architectures and concurrent import/launch/prune are not claimed.
 The NixOS boot bridge is a test fixture, rather than a general NixOS-to-Bedrock
 migration installer. The fixture disables networking/firewall, preloads the
 required modules and provides the real FHS udevadm expected by Bedrock's unit.
+
+## Prepared native strata and bundled clients
+
+`makeNativeStratum { name; payload; }` archives a complete producer-prepared
+stratum tree. Supply target-compatible executables and the native stratum
+metadata, such as `/etc/os-release`; the constructor adds no engine or Nix
+activation. Import its `stratum.tar.gz` with native `brl import`. This does not
+relocate binaries or install a whole distribution. The VM imports, executes,
+removes and replaces native strata through real Bedrock, and executes an
+installed static proof in an isolated root without `/nix`. The Bedrock host
+remains the documented NixOS fixture with its shared store.
+
+Nix-backed constructors accept a static ELF `bundledNixStore` and upstream
+`bundledNixNotices` files. They carry a private client with a Python-only SDK.
+Launch chooses a compatible external client first, then the bundle, before
+registration or hardware capture; explicit `IMPURIFIER_NIX_STORE` disables
+fallback. Trusted root preparation still uses host tools and never executes the
+stratum-owned client. An existing store, daemon and initial SDK preparation
+remain required. The bundled VM repeats the native stratum lifecycle with an
+incompatible external candidate.

@@ -3,6 +3,7 @@
   pkgs,
   impurifier,
   coreSrc,
+  bundled ? false,
 }:
 let
   installer = impurifier.installer;
@@ -14,11 +15,36 @@ let
     pname = "brl-app";
     version = "2";
   };
-  net = impurifier.makeNetStratum { pkg = app; };
-  offline = impurifier.makeOfflineStratum { pkg = app; };
-  upgrade = impurifier.makeOfflineStratum { pkg = app2; };
+  staticNix = import (coreSrc + "/tests/static-nix.nix") { inherit pkgs; };
+  bundleArgs = pkgs.lib.optionalAttrs bundled {
+    bundledNixStore = "${staticNix}/bin/nix-store";
+    bundledNixNotices = [ "${pkgs.nix.src}/COPYING" ];
+  };
+  builder = impurifier // {
+    makeNetStratum = args: impurifier.makeNetStratum (args // bundleArgs);
+    makeOfflineStratum = args: impurifier.makeOfflineStratum (args // bundleArgs);
+  };
+  native =
+    version:
+    impurifier.makeNativeStratum {
+      name = "native-proof";
+      payload =
+        pkgs.runCommand "native-brl-${version}" { nativeBuildInputs = [ pkgs.pkgsStatic.stdenv.cc ]; }
+          ''
+            mkdir -p $out/usr/bin $out/etc
+            echo '#include <stdio.h>' > proof.c
+            echo 'int main(void) { puts("native-brl-${version}"); return 0; }' >> proof.c
+            $CC -static proof.c -o $out/usr/bin/native-proof
+            printf 'NAME="Native proof"\nID=native-proof\n' > $out/etc/os-release
+            printf 'root:x:0:0:root:/root:/bin/sh\n' > $out/etc/passwd
+            printf 'root:x:0:\n' > $out/etc/group
+          '';
+    };
+  net = builder.makeNetStratum { pkg = app; };
+  offline = builder.makeOfflineStratum { pkg = app; };
+  upgrade = builder.makeOfflineStratum { pkg = app2; };
   fixture = import (coreSrc + "/tests/hardware-fixture.nix") { inherit pkgs; };
-  hardware = impurifier.makeOfflineStratum {
+  hardware = builder.makeOfflineStratum {
     pkg = fixture.tool;
     hardware = fixture.hardware // {
       libraries."libimpurifier-driver.so.1" = "/bedrock/strata/nixos/usr/lib/libimpurifier-driver.so.1";
@@ -27,8 +53,8 @@ let
 in
 {
   native-vm = pkgs.testers.runNixOSTest {
-    name = "brl-native-contract";
-    globalTimeout = 300;
+    name = "brl-native-contract${pkgs.lib.optionalString bundled "-bundled"}";
+    globalTimeout = 900;
     requiredFeatures = {
       kvm = false;
       devnet = false;
@@ -90,10 +116,26 @@ in
       machine.start()
       machine.wait_for_unit("multi-user.target", timeout=60)
       machine.succeed("/bedrock/bin/brl list; /bedrock/bin/strat nixos /run/current-system/sw/bin/true")
+      machine.succeed("/bedrock/bin/brl import native-proof ${native "1"}/stratum.tar.gz")
+      assert machine.succeed("/bedrock/bin/strat native-proof /usr/bin/native-proof").strip() == "native-brl-1"
+      machine.succeed("mkdir -p /srv/native/usr/bin; cp /bedrock/strata/native-proof/usr/bin/native-proof /srv/native/usr/bin/native-proof")
+      assert machine.succeed("chroot /srv/native /usr/bin/native-proof").strip() == "native-brl-1"
+      machine.succeed("test ! -e /srv/native/nix; test ! -e /bedrock/strata/native-proof/usr/share/brl-impurifier")
+      machine.succeed("/bedrock/bin/brl remove -d native-proof; /bedrock/bin/brl import native-proof ${native "2"}/stratum.tar.gz")
+      assert machine.succeed("/bedrock/bin/strat native-proof /usr/bin/native-proof").strip() == "native-brl-2"
+      machine.succeed("/bedrock/bin/brl remove -d native-proof; test ! -e /bedrock/strata/native-proof")
       machine.succeed("/bedrock/bin/brl import demo /root/net/stratum.tar.gz")
       machine.succeed("nix-store --gc; test ! -e ${builtins.unsafeDiscardStringContext (toString app)}")
+      ${pkgs.lib.optionalString bundled ''
+        machine.succeed("mkdir -p /home/consumer/no-nix; printf '#!${pkgs.runtimeShell}\\necho incompatible-client\\n' > /home/consumer/no-nix/nix-store; chmod 755 /home/consumer/no-nix/nix-store")
+      ''}
       def user(command):
-          return "su - consumer -c " + shlex.quote(command)
+          return "su - consumer -c " + shlex.quote(("PATH=/home/consumer/no-nix:$PATH " if ${
+            if bundled then "True" else "False"
+          } else "") + command)
+      ${pkgs.lib.optionalString bundled ''
+        assert machine.succeed(user("nix-store --version")).strip() == "incompatible-client"
+      ''}
       machine.fail(user("/bedrock/bin/strat demo /usr/bin/brl-app"))
       machine.succeed("/bedrock/bin/brl remove -d demo")
       machine.succeed("/bedrock/bin/brl import demo /root/offline/stratum.tar.gz")
